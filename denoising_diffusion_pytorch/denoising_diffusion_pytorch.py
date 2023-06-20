@@ -796,11 +796,11 @@ class GaussianDiffusion(nn.Module):
                 self.model_outputs[i] = self.model_outputs[i + 1]
             self.model_outputs[-1] = model_output
 
-            if self.solver_order == 1 or lower_order_nums < 1 or lower_order_final:
+            if self.solver_order == 1 or self.lower_order_nums < 1 or lower_order_final:
                 prev_sample = dpmsolver_first_order_update(
                     model_output, timestep, prev_timestep, sample
                 )
-            elif self.solver_order == 2 or lower_order_nums < 2 or lower_order_second:
+            elif self.solver_order == 2 or self.lower_order_nums < 2 or lower_order_second:
                 timestep_list = [self.inference_timesteps[step_index - 1], timestep]
                 prev_sample = mulitstep_dpmsolver_second_order_update(
                     self.model_outputs, timestep_list, prev_timestep, sample
@@ -811,8 +811,8 @@ class GaussianDiffusion(nn.Module):
                     self.model_outputs, timestep_list, prev_timestep, sample
                 )
             
-            if lower_order_nums < self.solver_order:
-                lower_order_nums += 1
+            if self.lower_order_nums < self.solver_order:
+                self.lower_order_nums += 1
 
             return prev_sample   
 
