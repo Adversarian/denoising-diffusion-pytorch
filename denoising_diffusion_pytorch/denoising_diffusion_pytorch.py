@@ -782,7 +782,7 @@ class GaussianDiffusion(nn.Module):
         
         def step(model_output, timestep, sample):
             if isinstance(timestep, torch.Tensor):
-                timestep = timesteps.device
+                timestep = timestep.to(timesteps.device)
             step_index = (timesteps == timestep).nonzero()
             if len(step_index) == 0:
                 step_index = len(timesteps) - 1
