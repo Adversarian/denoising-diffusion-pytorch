@@ -19,6 +19,7 @@ from torchvision import transforms as T, utils
 from einops import rearrange, reduce, repeat
 from einops.layers.torch import Rearrange
 
+import numpy as np
 from PIL import Image
 from tqdm.auto import tqdm
 from ema_pytorch import EMA
@@ -450,6 +451,9 @@ class GaussianDiffusion(nn.Module):
         objective = 'pred_v',
         beta_schedule = 'sigmoid',
         schedule_fn_kwargs = dict(),
+        sampling_method = "ddim",
+        lambda_min_clipped = -float("inf"),
+        dpmsolver_order = 3,
         ddim_sampling_eta = 0.,
         auto_normalize = True,
         offset_noise_strength = 0.,  # https://www.crosslabs.org/blog/diffusion-with-offset-noise
@@ -459,6 +463,7 @@ class GaussianDiffusion(nn.Module):
         super().__init__()
         assert not (type(self) == GaussianDiffusion and model.channels != model.out_dim)
         assert not model.random_or_learned_sinusoidal_cond
+        assert sampling_method in ["ddim", "dpmsolver++"], "`sampling_method` must be one of 'ddim' or 'dpmsolver++'"
 
         self.model = model
 
@@ -494,8 +499,17 @@ class GaussianDiffusion(nn.Module):
         self.sampling_timesteps = default(sampling_timesteps, timesteps) # default num sampling timesteps to number of timesteps at training
 
         assert self.sampling_timesteps <= timesteps
-        self.is_ddim_sampling = self.sampling_timesteps < timesteps
-        self.ddim_sampling_eta = ddim_sampling_eta
+        self.is_accelerated_sampling = self.sampling_timesteps < timesteps
+        if self.is_accelerated_sampling:
+            if sampling_method == "ddim":
+                self.ddim_sampling_eta = ddim_sampling_eta
+                self.accelerated_sample_fn = self.ddim_sample
+            elif sampling_method == "dpmsolver++":
+                assert isinstance(dpmsolver_order, int)
+                assert dpmsolver_order >= 1 and dpmsolver_order <=3
+                self.solver_order = dpmsolver_order
+                self.lambda_min_clipped = lambda_min_clipped
+                self.accelerated_sample_fn = self.dpmsolver_sample
 
         # helper function to register buffer from float64 to float32
 
@@ -512,6 +526,10 @@ class GaussianDiffusion(nn.Module):
         register_buffer('log_one_minus_alphas_cumprod', torch.log(1. - alphas_cumprod))
         register_buffer('sqrt_recip_alphas_cumprod', torch.sqrt(1. / alphas_cumprod))
         register_buffer('sqrt_recipm1_alphas_cumprod', torch.sqrt(1. / alphas_cumprod - 1))
+
+        # calculations for dpmsolver
+        if self.is_accelerated_sampling and sampling_method == "dpmsolver++":
+            register_buffer('lambda_t', torch.log(torch.sqrt(alphas_cumprod)) - torch.log(torch.sqrt(1. - alphas_cumprod)))
 
         # calculations for posterior q(x_{t-1} | x_t, x_0)
 
@@ -695,11 +713,132 @@ class GaussianDiffusion(nn.Module):
 
         ret = self.unnormalize(ret)
         return ret
+    
+    # Ported from the huggingface diffusers implementation
+    # See https://arxiv.org/abs/2206.00927 and https://arxiv.org/abs/2211.01095
+    @torch.inference_mode()
+    def dpmsolver_sample(self, shape, return_all_timesteps = False):
+        clipped_idx = torch.searchsorted(torch.flip(self.lambda_t, [0]), self.lambda_min_clipped)
+        timesteps = (
+            torch.linspace(0, self.num_timesteps - 1 - clipped_idx, self.sampling_timesteps + 1)
+            .round()[::-1][:-1]
+            .to(torch.int64)
+        ).to(self.device)
+
+        model_outputs = [
+            None,
+        ] * self.solver_order
+        
+        lower_order_nums = 0
+
+        def dpmsolver_first_order_update(model_output, timestep, prev_timestep, sample):
+            lambda_t, lambda_s = self.lambda_t[prev_timestep], self.lambda_t[timestep]
+            alpha_t = self.sqrt_alphas_cumprod[prev_timestep]
+            sigma_t, sigma_s = self.sqrt_one_minus_alphas_cumprod[prev_timestep], self.sqrt_one_minus_alphas_cumprod[timestep]
+            h = lambda_t - lambda_s
+            x_t = (sigma_t / sigma_s) * sample - (alpha_t * (torch.exp(-h) - 1.0)) * model_output 
+            return x_t
+
+        def mulitstep_dpmsolver_second_order_update(model_output_list, timestep_list, prev_timestep, sample):
+            t, s0, s1 = prev_timestep, timestep_list[-1], timestep_list[-2]
+            m0, m1 = model_output_list[-1], model_output_list[-2]
+            lambda_t, lambda_s0, lambda_s1 = self.lambda_t[t], self.lambda_t[s0], self.lambda_t[s1],
+            alpha_t = self.sqrt_alphas_cumprod[t]
+            sigma_t, sigma_s0 = self.sqrt_one_minus_alphas_cumprod[t], self.sqrt_one_minus_alphas_cumprod[s0]
+            h, h_0 = lambda_t - lambda_s0, lambda_s0 - lambda_s1
+            r0 = h_0 / h
+            D0, D1 = m0, (1.0 / r0) * (m0 - m1)
+            x_t = (
+                (sigma_t / sigma_s0) * sample
+                - (alpha_t * torch.exp(-h) - 1.0) * D0
+                - 0.5 * (alpha_t * (torch.exp(-h) - 1.0)) * D1
+            )
+            return x_t
+
+        def multistep_dpmsolver_third_order_update(model_output_list, timestep_list, prev_timestep, sample):
+            t, s0, s1, s2 = prev_timestep, timestep_list[-1], timestep_list[-2], timestep_list[-3]
+            m0, m1, m2 = model_output_list[-1], model_output_list[-2], model_output_list[-3]
+            lambda_t, lambda_s0, lambda_s1, lambda_s2 = (
+                self.lambda_t[t],
+                self.lambda_t[s0],
+                self.lambda_t[s1],
+                self.lambda_t[s2],
+            )
+            alpha_t = self.sqrt_alphas_cumprod[t]
+            sigma_t, sigma_s0 = self.sqrt_one_minus_alphas_cumprod[t], self.sqrt_one_minus_alphas_cumprod[s0]
+            h, h_0, h_1 = lambda_t - lambda_s0, lambda_s0 - lambda_s1, lambda_s1 - lambda_s2
+            r0, r1 = h_0 / h, h_1 / h
+            D0 = m0
+            D1_0, D1_1 = (1.0 / r0) * (m0 - m1), (1.0 / r1) * (m1 - m2)
+            D1 = D1_0 + (r0 / (r0 + r1)) * (D1_0 - D1_1)
+            D2 = (1.0 / (r0 + r1)) * (D1_0 - D1_1)
+            x_t = (
+                (sigma_t / sigma_s0) * sample
+                - (alpha_t * (torch.exp(-h) - 1.0)) * D0
+                + (alpha_t * ((torch.exp(-h) - 1.0) / h + 1.0)) * D1
+                - (alpha_t * ((torch.exp(-h) - 1.0 + h) / h**2 - 0.5)) * D2
+            )
+            return x_t
+        
+        def step(model_output, timestep, sample):
+            if isinstance(timestep, torch.Tensor):
+                timestep = timesteps.device
+            step_index = (timesteps == timestep).nonzero()
+            if len(step_index) == 0:
+                step_index = len(timesteps) - 1
+            else:
+                step_index = step_index.item()
+            prev_timestep = 0 if step_index == len(timesteps) - 1 else timesteps[step_index + 1]
+            lower_order_final = (step_index == len(timesteps) - 1) and len(self.timesteps) < 15
+            lower_order_second = (step_index == len(timesteps) - 2) and len(self.timesteps) < 15
+
+            for i in range(self.solver_order - 1):
+                model_outputs[i] = model_outputs[i + 1]
+            model_outputs[-1] = model_output
+
+            if self.solver_order == 1 or lower_order_nums < 1 or lower_order_final:
+                prev_sample = dpmsolver_first_order_update(
+                    model_output, timestep, prev_timestep, sample
+                )
+            elif self.solver_order == 2 or lower_order_nums < 2 or lower_order_second:
+                timestep_list = [timesteps[step_index - 1], timestep]
+                prev_sample = mulitstep_dpmsolver_second_order_update(
+                    model_outputs, timestep_list, prev_timestep, sample
+                )
+            else:
+                timestep_list = [timesteps[step_index - 2], timesteps[step_index - 1], timestep]
+                prev_sample = multistep_dpmsolver_third_order_update(
+                    model_outputs, timestep_list, prev_timestep, sample
+                )
+            
+            if lower_order_nums < self.solver_order:
+                lower_order_nums += 1
+
+            return prev_sample   
+
+        img = torch.randn(shape, device=self.device)
+        imgs = [img]
+
+        x_start = None
+
+        for t in tqdm(timesteps, desc = 'sampling loop time step'):
+            time_cond = torch.full((shape[0],), t, device=self.device, dtype=torch.long)
+            self_cond = x_start if self.self_condition else None
+            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, self_cond, clip_x_start=True, rederive_pred_noise=True)
+            
+            img = step(pred_noise, t, x_start)
+
+            imgs.append(img)
+
+        ret = img if not return_all_timesteps else torch.stack(imgs, dim = 1)
+
+        ret = self.unnormalize(ret)
+        return ret
 
     @torch.inference_mode()
     def sample(self, batch_size = 16, return_all_timesteps = False):
         image_size, channels = self.image_size, self.channels
-        sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
+        sample_fn = self.p_sample_loop if not self.is_accelerated_sampling else self.accelerated_sample_fn
         return sample_fn((batch_size, channels, image_size, image_size), return_all_timesteps = return_all_timesteps)
 
     @torch.inference_mode()
@@ -914,10 +1053,10 @@ class Trainer(object):
 
         if calculate_fid:
             self.calculate_fid = True
-            if not self.model.is_ddim_sampling:
+            if not self.model.is_accelerated_sampling:
                 self.accelerator.print(
-                    "WARNING: Robust FID computation requires a lot of generated samples and can therefore be very time consuming."\
-                    "Consider using DDIM sampling to save time."
+                    "WARNING: Robust FID computation requires a lot of generated samples and can therefore be very time consuming.\n"\
+                    "Consider using accelerated sampling by setting `sampling_timesteps` < `timesteps`."
                 )
             self.fid_scorer = FIDEvaluation(
                 batch_size=self.batch_size,
