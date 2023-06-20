@@ -719,17 +719,17 @@ class GaussianDiffusion(nn.Module):
     @torch.inference_mode()
     def dpmsolver_sample(self, shape, return_all_timesteps = False):
         clipped_idx = torch.searchsorted(torch.flip(self.lambda_t, [0]), self.lambda_min_clipped)
-        timesteps = (
+        self.inference_timesteps = (
             torch.linspace(0, self.num_timesteps - 1 - clipped_idx, self.sampling_timesteps + 1)
             .round().flip(-1)[:-1]
             .to(torch.int64)
         ).to(self.device)
 
-        model_outputs = [
+        self.model_outputs = [
             None,
         ] * self.solver_order
-        
-        lower_order_nums = 0
+
+        self.lower_order_nums = 0
 
         def dpmsolver_first_order_update(model_output, timestep, prev_timestep, sample):
             lambda_t, lambda_s = self.lambda_t[prev_timestep], self.lambda_t[timestep]
@@ -782,33 +782,33 @@ class GaussianDiffusion(nn.Module):
         
         def step(model_output, timestep, sample):
             if isinstance(timestep, torch.Tensor):
-                timestep = timestep.to(timesteps.device)
-            step_index = (timesteps == timestep).nonzero()
+                timestep = timestep.to(self.inference_timesteps.device)
+            step_index = (self.inference_timestepstimesteps == timestep).nonzero()
             if len(step_index) == 0:
-                step_index = len(timesteps) - 1
+                step_index = len(self.inference_timesteps) - 1
             else:
                 step_index = step_index.item()
-            prev_timestep = 0 if step_index == len(timesteps) - 1 else timesteps[step_index + 1]
-            lower_order_final = (step_index == len(timesteps) - 1) and len(self.timesteps) < 15
-            lower_order_second = (step_index == len(timesteps) - 2) and len(self.timesteps) < 15
+            prev_timestep = 0 if step_index == len(self.inference_timesteps) - 1 else self.inference_timesteps[step_index + 1]
+            lower_order_final = (step_index == len(self.inference_timesteps) - 1) and len(self.inference_timesteps) < 15
+            lower_order_second = (step_index == len(self.inference_timesteps) - 2) and len(self.inference_timesteps) < 15
 
             for i in range(self.solver_order - 1):
-                model_outputs[i] = model_outputs[i + 1]
-            model_outputs[-1] = model_output
+                self.model_outputs[i] = self.model_outputs[i + 1]
+            self.model_outputs[-1] = model_output
 
             if self.solver_order == 1 or lower_order_nums < 1 or lower_order_final:
                 prev_sample = dpmsolver_first_order_update(
                     model_output, timestep, prev_timestep, sample
                 )
             elif self.solver_order == 2 or lower_order_nums < 2 or lower_order_second:
-                timestep_list = [timesteps[step_index - 1], timestep]
+                timestep_list = [self.inference_timesteps[step_index - 1], timestep]
                 prev_sample = mulitstep_dpmsolver_second_order_update(
-                    model_outputs, timestep_list, prev_timestep, sample
+                    self.model_outputs, timestep_list, prev_timestep, sample
                 )
             else:
-                timestep_list = [timesteps[step_index - 2], timesteps[step_index - 1], timestep]
+                timestep_list = [self.inference_timesteps[step_index - 2], self.inference_timesteps[step_index - 1], timestep]
                 prev_sample = multistep_dpmsolver_third_order_update(
-                    model_outputs, timestep_list, prev_timestep, sample
+                    self.model_outputs, timestep_list, prev_timestep, sample
                 )
             
             if lower_order_nums < self.solver_order:
@@ -821,7 +821,7 @@ class GaussianDiffusion(nn.Module):
 
         x_start = None
 
-        for t in tqdm(timesteps, desc = 'sampling loop time step'):
+        for t in tqdm(self.inference_timesteps, desc = 'sampling loop time step'):
             time_cond = torch.full((shape[0],), t, device=self.device, dtype=torch.long)
             self_cond = x_start if self.self_condition else None
             pred_noise, x_start, *_ = self.model_predictions(img, time_cond, self_cond, clip_x_start=True, rederive_pred_noise=True)
