@@ -1051,6 +1051,7 @@ class Trainer(object):
 
         # FID-score computation
 
+        self.calculate_fid = False
         if calculate_fid:
             self.calculate_fid = True
             if not self.model.is_accelerated_sampling:
