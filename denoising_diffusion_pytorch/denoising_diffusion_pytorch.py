@@ -721,7 +721,7 @@ class GaussianDiffusion(nn.Module):
         clipped_idx = torch.searchsorted(torch.flip(self.lambda_t, [0]), self.lambda_min_clipped)
         timesteps = (
             torch.linspace(0, self.num_timesteps - 1 - clipped_idx, self.sampling_timesteps + 1)
-            .round()[::-1][:-1]
+            .round().flip(-1)[:-1]
             .to(torch.int64)
         ).to(self.device)
 
